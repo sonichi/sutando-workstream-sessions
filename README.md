@@ -1,59 +1,102 @@
-# task-workstream-sessions — EXPERIMENTAL
+# task-workstream-sessions — experimental
 
-> **Status: experimental. Not wired into the public `sonichi/sutando` repo.**
-> Extracted 2026-08-19 so it can be iterated on without gating anyone's CI.
+An optional executor for owner tasks that Sutando has already assigned to a
+workstream. It preserves provider context by maintaining one durable Claude or
+Codex session per `(runtime, workstream_id)`.
 
-Runs opted-in Team tasks and assigned owner work in bounded provider sessions,
-via `SUTANDO_TASK_EVENT_HANDLER`.
+This repository is public and is not wired into `sonichi/sutando` after
+[`sonichi/sutando#3148`](https://github.com/sonichi/sutando/pull/3148). It must
+prove itself here before anyone proposes bundling it again.
 
-## Why it was extracted
+## Boundary
 
-- Its test (`tests/task-workstream-session-worker.test.py`) fails **deterministically under
-  coverage** — measured 2026-08-19 on macOS: `plain 8/8 pass`, `coverage 0/3 pass`. Because
-  `sonichi/sutando` runs a `diff coverage >= 95% (python)` lane, that turned into a recurring
-  red check on PRs whose diffs could not reach this code.
-- `#3067` had already removed the Team execution path as unreachable-after-`probe()`.
-- On the host it was measured, it had **never recorded a session** —
-  `state/task-workstream-sessions.json` was absent while sibling state files were current.
+The architectural contract keeps scheduling policy in one central Sutando
+scheduler: global priority, FIFO ordering, lifecycle, leases, dependencies,
+supersession, cancellation, workstream assignment, and the final decision to
+dispatch a task. Not all of those capabilities exist in Sutando today; this is
+the boundary future scheduler work must preserve, not a claim about the current
+implementation.
 
-None of that means it is worthless; it means it should prove itself somewhere that isn't
-the critical path.
+This repository owns execution after that decision:
 
-## Re-integration bar
+- resume or create the provider session for the assigned workstream;
+- serialize provider runs within one workstream;
+- enforce hard and no-progress timeouts;
+- retain session IDs and provider-run marks under the workspace;
+- publish one result atomically;
+- return `UNHANDLED` when isolation is unavailable so owner work can use the
+  live-core fallback.
 
-Do not re-add to the public repo until:
-1. the test passes under coverage, repeatedly, and
-2. there is evidence of it actually handling a task end-to-end.
+It does not watch the task directory, reorder work, infer priority, classify
+workstreams, or decide whether old work has been superseded. Team and Guest
+tasks are always `UNHANDLED`; the former Team execution path was removed in
+[`sonichi/sutando#3067`](https://github.com/sonichi/sutando/pull/3067).
 
-## Deliberately no CI here
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the adapter and state contracts.
 
-This repo is private, and private-repo Actions minutes are billed per job. Add workflows
-only when someone decides to spend that budget.
+## Reproducible validation
 
-
-## Running the tests
-
-This suite drives sutando's launcher scripts, so it is an **integration** test against a
-sutando checkout — it was never self-contained, and six files are involved, not just the
-guard:
-
-```
-src/team_result_guard.py                     src/session-handoff.sh
-src/agent/claude/cli/start-cli.sh            src/watch-tasks-stream.sh
-src/agent/codex/cli/start-cli.sh             src/agent/codex/cli/task-notifier.sh
-```
-
-Point `SUTANDO_REPO` at a sutando checkout:
+The feature intentionally imports shared authorization policy from Sutando
+instead of copying it. `scripts/test.sh` checks out the compatible Sutando
+revision recorded in `SUTANDO_COMPAT_REF` unless `SUTANDO_REPO` already
+points to a checkout:
 
 ```bash
-SUTANDO_REPO=/path/to/sutando python3 tests/task-workstream-session-worker.test.py
-SUTANDO_REPO=/path/to/sutando python3 tests/shared-guard-contract.test.py
-SUTANDO_REPO=/path/to/sutando python3 task-workstream-sessions/scripts/session-worker.py --help
+./scripts/test.sh
+./scripts/test.sh --coverage
+./scripts/test.sh --repeat 5 --coverage
 ```
 
-Unset, every entry point exits 1 with a message naming `SUTANDO_REPO` — never a bare
-`ModuleNotFoundError`, so a missing dependency cannot be mistaken for a broken worker.
+The first command is the plain suite. The second exercises the same suite under
+coverage. The repeated form is the minimum evidence for the instrumentation
+failure that motivated extraction.
 
-**The guard is never vendored here.** `team_result_guard.py` has one owner in sutando's
-`src/`; this repo imports it. `tests/shared-guard-contract.test.py` asserts that — it fails
-if any of its three symbols are redefined locally.
+To test a different Sutando revision:
+
+```bash
+SUTANDO_REPO=/path/to/sutando ./scripts/test.sh --coverage
+```
+
+No credential or provider login is needed for the deterministic suite.
+
+With an authenticated Codex CLI, the opt-in live proof creates only temporary
+owner-local fixtures and prints sanitized session fingerprints:
+
+```bash
+SUTANDO_REPO=/path/to/sutando python3 scripts/e2e_codex.py
+```
+
+It proves initial execution, same-workstream resume, different-workstream
+isolation, distinct provider sessions, atomic result publication, and run-marker
+cleanup. The temporary task bodies and provider session IDs are not printed.
+
+## Opt-in adapter invocation
+
+When configured, Sutando's generic task handler calls the executable twice:
+`--probe` first, then without `--probe` when it accepts responsibility.
+Standalone invocation must identify the Sutando checkout so the adapter can
+import the shared tier policy:
+
+```bash
+export SUTANDO_REPO=/path/to/sutando
+export SUTANDO_TASK_EVENT_HANDLER="$PWD/task-workstream-sessions/scripts/session-worker.py"
+```
+
+This repository deliberately does not modify Sutando launchers or automatically
+enable itself. Persistent external-capability configuration is separate from
+proving the executor.
+
+## Proof bar
+
+Before reintegration is proposed:
+
+1. the full suite must pass under coverage repeatedly;
+2. a real provider task must publish a result end-to-end;
+3. a second task in the same workstream must resume the same provider session;
+4. a task in another workstream must use a different session; and
+5. a provider failure or timeout must leave owner work eligible for live-core
+   fallback.
+
+Evidence must name repository revisions and omit credentials and private task
+content. Passing this bar provides evidence; it is not automatic approval to
+reintegrate.

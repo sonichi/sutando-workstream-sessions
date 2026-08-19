@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run opted-in Team tasks and assigned owner work in bounded provider sessions."""
+"""Run scheduler-assigned owner work in bounded provider sessions."""
 
 from __future__ import annotations
 
@@ -28,31 +28,26 @@ SESSION_ID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
     re.IGNORECASE,
 )
-# The guard is owned by src/team_result_guard.py so the core's direct-core path
-# and this worker enforce one policy; these names are re-exported, not redefined.
+# The guard is owned by Sutando. An installed skill discovers its parent
+# checkout; standalone development declares the checkout explicitly.
 _GUARD_ROOT = next(
-    (p for p in Path(__file__).resolve().parents
-     if (p / "src" / "team_result_guard.py").is_file()),
+    (parent for parent in Path(__file__).resolve().parents
+     if (parent / "src" / "team_result_guard.py").is_file()),
     None,
 )
-if _GUARD_ROOT is not None and str(_GUARD_ROOT / "src") not in sys.path:
+if _GUARD_ROOT is None:
+    _configured_repo = os.environ.get("SUTANDO_REPO", "").strip()
+    _GUARD_ROOT = Path(_configured_repo).expanduser().resolve() if _configured_repo else None
+if _GUARD_ROOT is None or not (_GUARD_ROOT / "src" / "team_result_guard.py").is_file():
+    resolved_src = str(_GUARD_ROOT / "src") if _GUARD_ROOT is not None else ""
+    raise SystemExit(
+        "session-worker: team_result_guard.py not found. Run inside a sutando "
+        "checkout, or set SUTANDO_REPO to a sutando checkout "
+        f"(resolved src={resolved_src!r})."
+    )
+if str(_GUARD_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(_GUARD_ROOT / "src"))
-# Outside a sutando checkout the parent walk finds nothing; SUTANDO_SRC names the
-# directory holding team_result_guard.py. The guard is never vendored — one owner.
-elif _GUARD_ROOT is None:
-    _env_src = os.environ.get("SUTANDO_REPO", "").strip()
-    _env_src = str(Path(_env_src) / "src") if _env_src else ""
-    if _env_src and (Path(_env_src) / "team_result_guard.py").is_file():
-        if _env_src not in sys.path:
-            sys.path.insert(0, _env_src)
-    else:
-        raise SystemExit(
-            "session-worker: team_result_guard.py not found. Run inside a sutando "
-            "checkout, or set SUTANDO_REPO to a sutando checkout "
-            f"(resolved src={_env_src!r})."
-        )
 from team_result_guard import (  # noqa: E402
-
     resolve_access_tier,
 )
 
@@ -181,44 +176,6 @@ def _headers(task_file: Path) -> dict[str, str]:
             if key == "task":
                 break
     return headers
-
-
-# Collaborator trust is broker-attested. A Discord channel `collaborators` entry
-# writes an identical stamp with no broker behind it, so the origin is checked too.
-COLLABORATOR_ATTESTED_SOURCES = frozenset({"ag2space"})
-
-
-def resolve_task_source(task_file: Path) -> str:
-    """Read a task's trusted source with the same task-mid rule as the tier.
-
-    Task-last writers put it before ``task:``; the remote gateway is task-mid,
-    so with no pre-task value its final source line is the trusted one.
-    """
-    try:
-        content = task_file.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return ""
-    before_task = content.split("\ntask:", 1)[0]
-    candidates = [
-        line.partition(":")[2].strip().lower()
-        for line in before_task.splitlines()
-        if line.startswith("source:")
-    ]
-    if not candidates:
-        candidates = [
-            line.partition(":")[2].strip().lower()
-            for line in content.splitlines()
-            if line.startswith("source:")
-        ]
-    return candidates[-1] if candidates else ""
-
-
-
-
-
-
-
-
 
 
 def _terminate_process_group(process: subprocess.Popen) -> None:
@@ -441,18 +398,15 @@ def _codex_command(
 
 def _run_claude(workspace: Path, workstream_id: str, prompt: str, repo: Path) -> str:
     session_id, created = _session_id(workspace, "claude", workstream_id)
-    result = subprocess.run(
+    return_code, stdout, stderr = _run_process_bounded(
         _claude_command(session_id, not created, prompt, repo),
-        cwd=os.environ.get("SUTANDO_ISOLATED_WORKING_DIR", str(repo)),
-        text=True, stdin=subprocess.DEVNULL,
-        capture_output=True,
-        check=False,
+        Path(os.environ.get("SUTANDO_ISOLATED_WORKING_DIR", str(repo))),
     )
-    if result.returncode:
-        raise RuntimeError(result.stderr.strip() or f"claude exited {result.returncode}")
+    if return_code:
+        raise RuntimeError(stderr.strip() or f"claude exited {return_code}")
     if created:
         _record_session(workspace, "claude", workstream_id, session_id)
-    return result.stdout
+    return stdout
 
 
 def _run_codex(workspace: Path, workstream_id: str, prompt: str, repo: Path) -> str:
@@ -466,19 +420,15 @@ def _run_codex(workspace: Path, workstream_id: str, prompt: str, repo: Path) -> 
     os.close(fd)
     output_file = Path(output_name)
     try:
-        with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stderr_file:
-            process = subprocess.Popen(
-                _codex_command(session_id or None, prompt, repo, output_file),
-                cwd=os.environ.get("SUTANDO_ISOLATED_WORKING_DIR", str(repo)),
-                text=True, stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=stderr_file,
-            )
-            discovered = ""
-            assert process.stdout is not None
-            for line in process.stdout:
-                if session_id:
-                    continue
+        return_code, stdout, stderr = _run_process_bounded(
+            _codex_command(session_id or None, prompt, repo, output_file),
+            Path(os.environ.get("SUTANDO_ISOLATED_WORKING_DIR", str(repo))),
+        )
+        if return_code:
+            raise RuntimeError(stderr.strip() or f"codex exited {return_code}")
+        discovered = ""
+        if not session_id:
+            for line in stdout.splitlines():
                 try:
                     event = json.loads(line)
                 except (ValueError, TypeError):
@@ -487,11 +437,6 @@ def _run_codex(workspace: Path, workstream_id: str, prompt: str, repo: Path) -> 
                     candidate = str(event.get("thread_id") or "")
                     if SESSION_ID.fullmatch(candidate):
                         discovered = candidate
-            return_code = process.wait()
-            stderr_file.seek(0)
-            stderr = stderr_file.read()
-        if return_code:
-            raise RuntimeError(stderr.strip() or f"codex exited {return_code}")
         if not session_id and not discovered:
             raise RuntimeError("codex did not report a valid thread.started session id")
         if discovered:

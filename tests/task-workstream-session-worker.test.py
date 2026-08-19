@@ -20,7 +20,14 @@ from pathlib import Path
 from unittest import mock
 
 
-REPO = Path(__file__).resolve().parents[1]
+FEATURE_REPO = Path(__file__).resolve().parents[1]
+_sutando_repo = os.environ.get("SUTANDO_REPO", "").strip()
+if not _sutando_repo:
+    raise RuntimeError("set SUTANDO_REPO or run scripts/test.sh")
+REPO = Path(_sutando_repo).expanduser().resolve()
+if not (REPO / "src" / "team_result_guard.py").is_file():
+    raise RuntimeError(f"not a compatible Sutando checkout: {REPO}")
+SUT_REPO = REPO
 # Guards a hang, not promptness — a leaked worker holds stdout open forever, so any
 # bound catches it. Every timing claim here is a separate assert; keep this generous.
 SHUTDOWN_DRAIN_TIMEOUT_S = 30
@@ -39,22 +46,11 @@ WORKER_EXIT_S = 2.0
 # Must actually exist: a missing binary raises before any assertion, so a guard
 # under test would look enforced by the spawn failing rather than by the guard.
 NOOP_COMMAND = [sys.executable, "-c", "pass"]
-WORKER = REPO / "task-workstream-sessions" / "scripts" / "session-worker.py"
+WORKER = FEATURE_REPO / "task-workstream-sessions" / "scripts" / "session-worker.py"
 spec = importlib.util.spec_from_file_location("workstream_session_worker", WORKER)
 worker = importlib.util.module_from_spec(spec)
 # The worker no longer re-exports the result guard; team_result_guard still owns
 # it for the gateway bridge, so these tests bind the owner directly.
-# This suite drives sutando's launcher scripts, so it needs a sutando checkout:
-# REPO/src when vendored there, else SUTANDO_REPO. Six files, not just the guard.
-SUT_REPO = REPO
-if not (SUT_REPO / "src" / "team_result_guard.py").is_file():
-    _env = os.environ.get("SUTANDO_REPO", "").strip()
-    if not (_env and (Path(_env) / "src" / "team_result_guard.py").is_file()):
-        raise SystemExit(
-            "task-workstream-session-worker.test: needs a sutando checkout. "
-            "Set SUTANDO_REPO=/path/to/sutando (must contain src/team_result_guard.py)."
-        )
-    SUT_REPO = Path(_env)
 sys.path.insert(0, str(SUT_REPO / "src"))
 import team_result_guard as _guard  # noqa: E402
 assert spec.loader is not None
@@ -162,6 +158,19 @@ def test_resolution_routes_bounded_tiers_before_owner_workstreams() -> None:
 
 
 
+def test_provider_run_mark_exists_only_while_the_provider_runs() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        workspace = Path(td)
+        task_name = "task-owner.txt"
+        mark = workspace / worker.RUN_MARK_DIR / f"{task_name}.started"
+        assert not mark.exists()
+        with worker._run_mark(workspace, task_name):
+            payload = json.loads(mark.read_text())
+            assert payload["pid"] == os.getpid()
+            assert isinstance(payload["started"], float)
+        assert not mark.exists()
+
+
 def test_tier_parser_prevents_task_body_escalation_and_fails_closed() -> None:
     with tempfile.TemporaryDirectory() as td:
         workspace = Path(td)
@@ -191,7 +200,7 @@ def test_team_runtime_skips_the_owner_session_handoff() -> None:
         environment = {
             "HOME": str(root),
             "PATH": os.environ["PATH"],
-            "SUTANDO_REPO_DIR": str(root / "missing-repo"),
+            "SUTANDO_REPO": str(root / "missing-repo"),
             "SUTANDO_TEAM_RUNTIME": "1",
         }
         result = subprocess.run(
@@ -219,7 +228,7 @@ def test_owner_session_handoff_does_not_accept_the_team_bypass_by_default() -> N
             ["bash", str(_staged_handoff(root))],
             cwd=root,
             env={"HOME": str(root), "PATH": os.environ["PATH"],
-                 "SUTANDO_REPO_DIR": str(root / "missing-repo")},
+                 "SUTANDO_REPO": str(root / "missing-repo")},
             capture_output=True, text=True, timeout=5,
         )
         assert result.returncode != 0, (
@@ -429,6 +438,37 @@ def test_bounded_runtime_helper_edges() -> None:
 
 
 
+
+
+def test_owner_provider_paths_are_bounded_and_retryable() -> None:
+    for runtime in ("claude", "codex"):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            workspace = root / "workspace"
+            project = root / "project"
+            project.mkdir()
+            _executable(
+                root / runtime,
+                "#!/bin/sh\nprintf partial\nsleep 30\n",
+            )
+            task = _task(workspace, f"task-{runtime}-timeout")
+            _store(workspace, {
+                task.stem: {"workstream_id": "workstream-a"},
+            })
+            started = time.monotonic()
+            result = _run(runtime, workspace, task, {
+                "PATH": f"{root}:{os.environ['PATH']}",
+                "SUTANDO_ISOLATED_WORKING_DIR": str(project),
+                "SUTANDO_TIER_HARD_TIMEOUT": "0.4",
+                "SUTANDO_TIER_STALL_TIMEOUT": "0.2",
+            })
+            assert result.returncode == 1, (runtime, result)
+            assert "timeout" in result.stderr or "progress" in result.stderr
+            assert time.monotonic() - started < 2
+            assert not (workspace / "results" / task.name).exists()
+            assert not any(
+                (workspace / worker.RUN_MARK_DIR).glob("*.started")
+            )
 
 
 def test_team_scanner_warmup_allows_optional_detector_and_rejects_bad_contract() -> None:
@@ -1511,11 +1551,9 @@ def test_unrecognised_claim_disposition_is_never_published_to_the_live_core() ->
                 process.communicate(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
 
 
-def test_runtime_wiring_is_optional_and_adapter_injected() -> None:
+def test_generic_handler_contract_remains_available_after_extraction() -> None:
     watcher = (SUT_REPO / "src" / "watch-tasks-stream.sh").read_text()
     notifier = (SUT_REPO / "src" / "agent" / "codex" / "cli" / "task-notifier.sh").read_text()
-    claude = (SUT_REPO / "src" / "agent" / "claude" / "cli" / "start-cli.sh").read_text()
-    codex = (SUT_REPO / "src" / "agent" / "codex" / "cli" / "start-cli.sh").read_text()
     assert '${SUTANDO_TASK_EVENT_HANDLER:-}' in watcher
     assert "--probe" in watcher
     assert 'printf \'TASK_FILE: %s\\n\'' in watcher
@@ -1524,13 +1562,11 @@ def test_runtime_wiring_is_optional_and_adapter_injected() -> None:
     assert 'os.environ.pop("SUTANDO_TASK_EVENT_HANDLER"' not in notifier
     assert "TASK_HANDLER_CLAIMS_DIR" in notifier
     assert "TASK_HANDLER_FALLBACKS_DIR" in notifier
-    assert "skills/task-workstream-sessions/scripts/session-worker.py" in claude
-    assert "skills/task-workstream-sessions/scripts/session-worker.py" in codex
-    assert 'NOTIFIER_ENV_ARGS+=(-e "SUTANDO_SELF_DEVELOPMENT_ENABLED=' in codex
 
 
 if __name__ == "__main__":
     test_resolution_routes_bounded_tiers_before_owner_workstreams()
+    test_provider_run_mark_exists_only_while_the_provider_runs()
     test_tier_parser_prevents_task_body_escalation_and_fails_closed()
     test_team_runtime_skips_the_owner_session_handoff()
     test_owner_session_handoff_does_not_accept_the_team_bypass_by_default()
@@ -1544,6 +1580,7 @@ if __name__ == "__main__":
     test_partial_output_then_stall_still_hits_the_deadline()
     test_closes_pipes_then_stalls_still_hits_the_deadline()
     test_bounded_runtime_helper_edges()
+    test_owner_provider_paths_are_bounded_and_retryable()
     test_claude_creates_then_resumes_the_same_durable_session()
     test_nonzero_provider_stdout_is_never_written_as_a_result()
     test_archived_result_is_not_replayed_on_restart_scan()
@@ -1563,5 +1600,5 @@ if __name__ == "__main__":
     test_codex_notifier_dispatches_each_isolated_task_once_without_waiting()
     test_codex_notifier_never_submits_a_watcher_claim_to_live_core()
     test_unrecognised_claim_disposition_is_never_published_to_the_live_core()
-    test_runtime_wiring_is_optional_and_adapter_injected()
+    test_generic_handler_contract_remains_available_after_extraction()
     print("task workstream session worker tests passed")
