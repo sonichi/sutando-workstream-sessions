@@ -29,3 +29,31 @@ Do not re-add to the public repo until:
 
 This repo is private, and private-repo Actions minutes are billed per job. Add workflows
 only when someone decides to spend that budget.
+
+
+## Running the tests
+
+This suite drives sutando's launcher scripts, so it is an **integration** test against a
+sutando checkout — it was never self-contained, and six files are involved, not just the
+guard:
+
+```
+src/team_result_guard.py                     src/session-handoff.sh
+src/agent/claude/cli/start-cli.sh            src/watch-tasks-stream.sh
+src/agent/codex/cli/start-cli.sh             src/agent/codex/cli/task-notifier.sh
+```
+
+Point `SUTANDO_REPO` at a sutando checkout:
+
+```bash
+SUTANDO_REPO=/path/to/sutando python3 tests/task-workstream-session-worker.test.py
+SUTANDO_REPO=/path/to/sutando python3 tests/shared-guard-contract.test.py
+SUTANDO_REPO=/path/to/sutando python3 task-workstream-sessions/scripts/session-worker.py --help
+```
+
+Unset, every entry point exits 1 with a message naming `SUTANDO_REPO` — never a bare
+`ModuleNotFoundError`, so a missing dependency cannot be mistaken for a broken worker.
+
+**The guard is never vendored here.** `team_result_guard.py` has one owner in sutando's
+`src/`; this repo imports it. `tests/shared-guard-contract.test.py` asserts that — it fails
+if any of its three symbols are redefined locally.
