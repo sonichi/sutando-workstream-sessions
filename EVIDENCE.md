@@ -62,3 +62,22 @@ The first task established a random nonce without returning it. A second task
 assigned to the same workstream returned that nonce from resumed conversation
 context. A third task assigned to a different workstream reported no prior
 nonce, and the two workstreams recorded different provider session IDs.
+
+## AG2 Space room-session end to end
+
+Recorded 2026-08-20 on the dev deployment after the broker and Sutando
+`session_scope` transport changes landed:
+
+```text
+Room A stored MAPLE-COMET-4827.
+Room B stored SILVER-REEF-9153.
+Room A recalled only MAPLE-COMET-4827.
+Room B recalled only SILVER-REEF-9153.
+Both rooms reached responded and recorded different provider session IDs.
+```
+
+The two seed tasks completed nearly concurrently. Durable state showed one
+record per room, and each recall reused its room's existing provider session.
+A separate Guest greeting in Room B was stamped `access_tier: guest`, ran via
+`codex exec --sandbox read-only`, and reached `responded`; it did not enter the
+owner's durable room session.

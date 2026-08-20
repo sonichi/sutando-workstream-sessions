@@ -118,6 +118,17 @@ def _store(workspace: Path, assignments: dict) -> None:
     }), encoding="utf-8")
 
 
+def _room_task(workspace: Path, task_id: str, room_id: str = "!room:ag2.space") -> Path:
+    path = workspace / "tasks" / f"{task_id}.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"id: {task_id}\nsession_scope: room\ntask: do the thing\n"
+        f"source: ag2space\nchannel_id: {room_id}\naccess_tier: owner\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 def _run(runtime: str, workspace: Path, task: Path, env: dict) -> subprocess.CompletedProcess:
     results = workspace / "results"
     results.mkdir(parents=True, exist_ok=True)
@@ -150,6 +161,53 @@ def test_resolution_routes_bounded_tiers_before_owner_workstreams() -> None:
         assert worker.probe("claude", workspace, owner) == 0
         assert worker.probe("claude", workspace, team) == worker.UNHANDLED
         assert worker.probe("claude", workspace, _task(workspace, "task-guest", "guest")) == worker.UNHANDLED
+
+
+def test_ag2space_room_session_is_opt_in_and_stable() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        workspace = Path(td)
+        first = _room_task(workspace, "task-room-one")
+        second = _room_task(workspace, "task-room-two")
+        other = _room_task(workspace, "task-other-room", "!other:ag2.space")
+        opaque = _room_task(workspace, "task-opaque-room", "!opaqueRoomIdentifier")
+        first_key = worker.resolve_room_session(first)
+        assert first_key and first_key == worker.resolve_room_session(second)
+        assert first_key != worker.resolve_room_session(other)
+        assert worker.resolve_room_session(opaque)
+        assert worker.probe("claude", workspace, first) == 0
+
+        untrusted = _room_task(workspace, "task-untrusted")
+        untrusted.write_text(untrusted.read_text().replace("source: ag2space", "source: discord"))
+        assert worker.resolve_room_session(untrusted) is None
+        malformed = _room_task(workspace, "task-malformed", "not-a-room")
+        assert worker.resolve_room_session(malformed) is None
+        disabled = _room_task(workspace, "task-disabled")
+        disabled.write_text(disabled.read_text().replace("session_scope: room\n", ""))
+        assert worker.resolve_room_session(disabled) is None
+        assert worker.probe("claude", workspace, disabled) == worker.UNHANDLED
+        team = _room_task(workspace, "task-room-team")
+        team.write_text(team.read_text().replace("access_tier: owner", "access_tier: team"))
+        assert worker.resolve_room_session(team) is None
+
+
+def test_room_messages_reuse_one_durable_session() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        workspace = Path(td)
+        first_key = worker.resolve_room_session(_room_task(workspace, "task-room-first"))
+        second_key = worker.resolve_room_session(_room_task(workspace, "task-room-second"))
+        other_key = worker.resolve_room_session(
+            _room_task(workspace, "task-room-other", "!other:ag2.space"))
+        assert first_key and first_key == second_key
+        assert other_key and other_key != first_key
+
+        session_id, created = worker._session_id(workspace, "codex", first_key)
+        assert created
+        worker._record_session(workspace, "codex", first_key, session_id)
+        resumed_id, created = worker._session_id(workspace, "codex", second_key)
+        assert not created and resumed_id == session_id
+
+        other_id, created = worker._session_id(workspace, "codex", other_key)
+        assert created and other_id != session_id
 
 
 
@@ -1567,6 +1625,8 @@ def test_generic_handler_contract_remains_available_after_extraction() -> None:
 if __name__ == "__main__":
     test_resolution_routes_bounded_tiers_before_owner_workstreams()
     test_provider_run_mark_exists_only_while_the_provider_runs()
+    test_ag2space_room_session_is_opt_in_and_stable()
+    test_room_messages_reuse_one_durable_session()
     test_tier_parser_prevents_task_body_escalation_and_fails_closed()
     test_team_runtime_skips_the_owner_session_handoff()
     test_owner_session_handoff_does_not_accept_the_team_bypass_by_default()

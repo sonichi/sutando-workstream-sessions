@@ -1,6 +1,6 @@
 ---
 name: task-workstream-sessions
-description: Execute scheduler-assigned owner tasks in durable provider sessions isolated by workstream. This optional adapter never schedules, classifies, or runs non-owner work.
+description: Execute opted-in AG2 Space room tasks and scheduler-assigned owner tasks in durable provider sessions. This optional adapter never schedules, classifies, or runs non-owner work.
 user-invocable: false
 ---
 
@@ -19,6 +19,14 @@ cancellation, and task lifecycle in one central Sutando scheduler. Not all of
 those capabilities exist there today. This adapter only executes owner work
 made eligible by its caller; it does not scan the queue or create a competing
 scheduling rule.
+
+An owner may also opt an AG2 Space Agent Native card into a separate room
+session. Only an exact broker-authored `session_scope: room` header with a valid
+Matrix room ID is handled; missing or malformed metadata keeps the main session.
+Room IDs are hashed for state and lock keys, so one room is serialized while
+different rooms can use the watcher's bounded worker pool in parallel. The same
+room hash indexes durable provider state, so every message in one room resumes
+one session rather than creating a session per message.
 
 Team and Guest tasks are always unhandled. Ungrouped, invalid, or unavailable
 owner assignments also return unhandled so Sutando can use the selected core's

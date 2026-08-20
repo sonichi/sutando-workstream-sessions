@@ -1,8 +1,9 @@
 # task-workstream-sessions — experimental
 
-An optional executor for owner tasks that Sutando has already assigned to a
-workstream. It preserves provider context by maintaining one durable Claude or
-Codex session per `(runtime, workstream_id)`.
+An optional executor for owner tasks that Sutando has assigned to a workstream
+or that an AG2 Space owner has explicitly opted into room isolation. It
+preserves provider context by maintaining one durable Claude or Codex session
+per `(runtime, session key)`.
 
 This repository is public and is not wired into `sonichi/sutando` after
 [`sonichi/sutando#3148`](https://github.com/sonichi/sutando/pull/3148). It must
@@ -20,6 +21,7 @@ implementation.
 This repository owns execution after that decision:
 
 - resume or create the provider session for the assigned workstream;
+- derive a stable, hashed session key for an opted-in AG2 Space room;
 - serialize provider runs within one workstream;
 - enforce hard and no-progress timeouts;
 - retain session IDs and provider-run marks under the workspace;
@@ -31,6 +33,18 @@ It does not watch the task directory, reorder work, infer priority, classify
 workstreams, or decide whether old work has been superseded. Team and Guest
 tasks are always `UNHANDLED`; the former Team execution path was removed in
 [`sonichi/sutando#3067`](https://github.com/sonichi/sutando/pull/3067).
+
+## AG2 Space room opt-in
+
+The adapter accepts a room session only for an owner-tier AG2 Space task with
+the exact trusted header `session_scope: room` and a valid Matrix room ID.
+Missing, disabled, malformed, Team, Guest, and non-AG2 inputs remain
+`UNHANDLED`, preserving the existing main-session and sandbox paths.
+
+The room ID is SHA-256 hashed into the durable session key. Two messages in the
+same room therefore resume one provider session; they do not create a session
+per message. Different rooms get different keys and may execute concurrently
+through Sutando's bounded worker pool.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the adapter and state contracts.
 

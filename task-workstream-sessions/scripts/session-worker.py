@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -50,6 +51,7 @@ if str(_GUARD_ROOT / "src") not in sys.path:
 from team_result_guard import (  # noqa: E402
     resolve_access_tier,
 )
+from local_task_protocol import parse_task_headers_trusted  # noqa: E402
 
 
 def _read_json(path: Path) -> dict:
@@ -308,6 +310,30 @@ def resolve_workstream(workspace: Path, task_file: Path) -> Optional[str]:
     return workstream_id
 
 
+def resolve_room_session(task_file: Path) -> Optional[str]:
+    """Return a stable key only for an owner task attested by AG2 Space."""
+    if resolve_access_tier(task_file) != "owner":
+        return None
+    try:
+        content = task_file.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    headers = parse_task_headers_trusted(content).headers
+    if (headers.get("source") or "").lower() != "ag2space":
+        return None
+    if headers.get("session_scope") != "room":
+        return None
+    room_id = headers.get("channel_id") or ""
+    if not re.fullmatch(r"!\S{1,400}", room_id):
+        return None
+    digest = hashlib.sha256(room_id.encode("utf-8")).hexdigest()
+    return f"ag2space-room-{digest}"
+
+
+def resolve_session_key(workspace: Path, task_file: Path) -> Optional[str]:
+    return resolve_room_session(task_file) or resolve_workstream(workspace, task_file)
+
+
 def _state_path(workspace: Path) -> Path:
     return workspace / "state" / "task-workstream-sessions.json"
 
@@ -464,8 +490,8 @@ def probe(runtime: str, workspace: Path, task_file: Path) -> int:
         return UNHANDLED
     if tier == "guest":
         return UNHANDLED
-    workstream_id = resolve_workstream(workspace, task_file)
-    if not workstream_id:
+    session_key = resolve_session_key(workspace, task_file)
+    if not session_key:
         return UNHANDLED
     return 0
 
@@ -478,11 +504,11 @@ def handle(runtime: str, workspace: Path, task_file: Path, results_dir: Path, re
     tier = resolve_access_tier(task_file)
     result_path = results_dir / task_file.name
 
-    workstream_id = resolve_workstream(workspace, task_file)
-    assert workstream_id is not None
+    session_key = resolve_session_key(workspace, task_file)
+    assert session_key is not None
     if _completed_result_exists(results_dir, task_file.name):
         return 0
-    lock_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", f"{runtime}-{workstream_id}")[:180]
+    lock_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", f"{runtime}-{session_key}")[:180]
     try:
         with _locked(workspace / "state" / "task-workstream-session-locks" / f"{lock_name}.lock"):
             if _completed_result_exists(results_dir, task_file.name):
@@ -491,9 +517,9 @@ def handle(runtime: str, workspace: Path, task_file: Path, results_dir: Path, re
             # mark, never to process age.
             with _run_mark(workspace, task_file.name):
                 body = (
-                    _run_claude(workspace, workstream_id, _prompt(task_file), repo)
+                    _run_claude(workspace, session_key, _prompt(task_file), repo)
                     if runtime == "claude"
-                    else _run_codex(workspace, workstream_id, _prompt(task_file), repo)
+                    else _run_codex(workspace, session_key, _prompt(task_file), repo)
                 )
             if not body.strip():
                 raise RuntimeError(f"{runtime} returned an empty result")

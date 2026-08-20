@@ -3,15 +3,15 @@
 ## Role in the task pipeline
 
 ```text
-owner request
-    ↓
-future central Sutando scheduler
+owner request                         opted-in AG2 Space room request
+    ↓                                             ↓
+future central Sutando scheduler      broker-authored session_scope: room
   priority · lifecycle · dependencies · supersession · cancellation
-    ↓ approved dispatch
+    ↓ approved dispatch                           ↓
 generic SUTANDO_TASK_EVENT_HANDLER protocol
     ↓
 workstream-session executor
-  assignment lookup · per-workstream lock · provider resume/new · atomic result
+  assignment/room key · per-session lock · provider resume/new · atomic result
     ↓
 Sutando result delivery
 ```
@@ -37,6 +37,13 @@ Exit `0` means handled or eligible. Exit `3` (`UNHANDLED`) returns the task to
 Sutando's owner fallback. Other exits are retryable handler failures. Team and
 Guest tasks always return `UNHANDLED` before any provider launch.
 
+An AG2 Space room is eligible only when the broker supplies exact
+`session_scope: room` metadata on an owner task with a valid Matrix room ID.
+The executor hashes that ID into one stable session key. All messages from the
+same room share the key and persisted provider session; different rooms do not.
+Absent or invalid opt-in metadata returns `UNHANDLED` and preserves the legacy
+path.
+
 The adapter imports `resolve_access_tier` from Sutando's
 `src/team_result_guard.py`. `SUTANDO_REPO` resolves that dependency when the
 feature is external; parent-checkout discovery remains for a future installed
@@ -47,8 +54,8 @@ skill. Shared policy is never copied here.
 All mutable data remains owner-local under the selected workspace:
 
 - `data/task-workstreams.json`: scheduler/classifier-owned assignments, read only;
-- `state/task-workstream-sessions.json`: session IDs keyed by runtime/workstream;
-- `state/task-workstream-session-locks/`: one provider run per workstream;
+- `state/task-workstream-sessions.json`: session IDs keyed by runtime and stable workstream/room key;
+- `state/task-workstream-session-locks/`: one provider run per stable session key;
 - `state/task-workstream-runs/`: provider start markers for health monitoring;
 - `results/`: atomic publish-once result files owned by the normal delivery path.
 
